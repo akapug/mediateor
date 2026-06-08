@@ -1,11 +1,10 @@
 //! `mediator-types` — the shared contract for the trusted-mediator kernel.
 //!
 //! Pure data + trait interfaces. **No logic.** Every other crate depends on
-//! this and only this for cross-crate types. Agents implementing the other
-//! crates may add helper methods, but must not break these signatures.
+//! this and only this for cross-crate types.
 //!
 //! Design north star: a *backstage cathedral*. The host prover holds the
-//! formalizable core; the LLM operates it; humans receive a kind, plain
+//! formalizable core; the council operates it; humans receive a kind, plain
 //! rendering. Money is always integer **cents** (never floats).
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +13,7 @@ use std::collections::HashMap;
 pub type PartyId = String;
 pub type ClaimId = String;
 pub type ItemId = String;
+pub type ModelId = String;
 
 // ───────────────────────── typed many-sorted IR ─────────────────────────
 
@@ -35,7 +35,6 @@ pub enum Term {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Formula {
-    /// A Bool-sorted term (predicate application).
     Atom(Term),
     Eq(Term, Term),
     Le(Term, Term),
@@ -47,7 +46,6 @@ pub enum Formula {
     Iff(Box<Formula>, Box<Formula>),
     Forall(String, Sort, Box<Formula>),
     Exists(String, Sort, Box<Formula>),
-    /// Shallow deontic operators (the embedded normative layer).
     Obligation(Box<Formula>),
     Permission(Box<Formula>),
 }
@@ -67,13 +65,9 @@ pub struct Sig {
 pub struct Claim {
     pub id: ClaimId,
     pub party: PartyId,
-    /// The human sentence, verbatim.
     pub nl: String,
-    /// Its formalization (the untrusted proposal, once gated).
     pub formula: Formula,
-    /// Deterministic plain-English back-render shown for confirmation.
     pub english_render: String,
-    /// Epistemic entrenchment: higher = harder to give up (AGM weight).
     pub weight: i64,
     pub defeasible: bool,
     pub active: bool,
@@ -101,7 +95,6 @@ pub struct ContestedItem {
     pub divisible: bool,
 }
 
-/// A party's 100-point allocation across contested items (fair division).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Valuation {
     pub party: PartyId,
@@ -116,27 +109,54 @@ pub struct Party {
     pub signature: Vec<Sig>,
 }
 
+/// Extended party context: everything a party's agent carries into the council.
+/// This is the intake form — filed before the council convenes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct PartyContext {
+    /// Plain-language narrative this party wants the council to understand.
+    pub narrative: String,
+    /// Key evidence items (filenames, descriptions, or free text).
+    pub evidence: Vec<EvidenceItem>,
+    /// Pre-agreed outcome preferences, ordered by priority.
+    pub priorities: Vec<String>,
+    /// Any constraints the party insists must hold in any resolution.
+    pub hard_constraints: Vec<String>,
+    /// Optional: how the party pre-agreed to handle a final-decision outcome.
+    /// E.g. "binding arbitration", "accept council majority", "mediated proposal only".
+    pub final_decision_mode: Option<String>,
+}
+
+/// A single piece of evidence a party submits.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceItem {
+    pub id: String,
+    pub label: String,
+    /// Free-text description or inline content. URLs/hashes accepted.
+    pub content: String,
+    /// Which party submitted this.
+    pub submitted_by: PartyId,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Dispute {
     pub title: String,
     pub parties: Vec<Party>,
     pub claims: Vec<Claim>,
-    /// Facts both parties stipulate (shared ground / lease terms).
     pub stipulated: Vec<Formula>,
     pub ledger: Ledger,
     pub contested_items: Vec<ContestedItem>,
     pub valuations: Vec<Valuation>,
+    /// Rich per-party intake context. Optional — absent in legacy scenarios.
+    #[serde(default)]
+    pub party_contexts: HashMap<PartyId, PartyContext>,
 }
 
 // ─────────────────────────── prover verdicts ────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Verdict {
-    /// The named lemma was discharged by the host.
     Proved,
-    /// Its negation was discharged (the claim is certified false).
     Refuted,
-    /// The host could not decide it (reported honestly, never as consistent).
     Unknown,
     Error(String),
 }
@@ -146,11 +166,8 @@ pub enum Verdict {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settlement {
     pub label: String,
-    /// Indivisible items awarded whole.
     pub allocations: Vec<(ItemId, PartyId)>,
-    /// Divisible items, fraction to the *first* party in `parties` order.
     pub splits: Vec<(ItemId, f64)>,
-    /// Each party's total points received (fairness is read off these).
     pub party_points: Vec<(PartyId, f64)>,
     pub envy_free: bool,
     pub equitable: bool,
@@ -165,7 +182,6 @@ pub struct Receipt {
     pub seq: u64,
     pub prev_hash: String,
     pub hash: String,
-    /// The operation name (e.g. "verify_ledger", "isolate_crux").
     pub op: String,
     pub detail: serde_json::Value,
     pub verdict: Option<Verdict>,
@@ -180,51 +196,112 @@ pub struct Conflict {
     pub claim_ids: Vec<ClaimId>,
 }
 
-/// The product of analyzing a dispute. The operator cockpit and the party
-/// view are two *projections* of this single structure.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Analysis {
-    /// Plain-language facts both parties already share (bigger than the fight).
     pub shared_core: Vec<String>,
-    /// The irreducible knots — genuine inter-party disagreement.
     pub genuine_conflicts: Vec<Conflict>,
-    /// "Fights" that were only different words — dissolved with a receipt.
     pub dissolved: Vec<String>,
-    /// The certified refund, if the ledger is decidable.
     pub ledger_refund_cents: Option<i64>,
-    /// Plain findings, e.g. "claimed total $500 refuted; itemized = $450".
     pub ledger_findings: Vec<String>,
-    /// The single contested predicate the whole obligation reduces to.
     pub crux: Option<String>,
-    /// Certified-fair settlement options to accept, reject, or counter.
     pub settlements: Vec<Settlement>,
+}
+
+// ─────────────────────── council deliberation types ──────────────────────
+
+/// One model's vote on a resolution option.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CouncilVote {
+    /// The model that cast this vote.
+    pub model: ModelId,
+    /// Friendly display label for the model.
+    pub model_label: String,
+    /// The option index being voted on.
+    pub option_idx: usize,
+    /// true = approve, false = reject.
+    pub approve: bool,
+    /// The model's reasoning (kept for transparency; not authoritative).
+    pub reasoning: String,
+    /// Confidence 0.0–1.0 the model expresses.
+    pub confidence: f64,
+    /// Did the anti-malfeasance check flag this vote as suspect?
+    pub flagged: bool,
+    /// If flagged, a description of why.
+    pub flag_reason: Option<String>,
+}
+
+/// One round of the council deliberation: all models produce arguments,
+/// then vote.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DeliberationRound {
+    pub round: u32,
+    /// Per-model argument/position text (model_id → text).
+    pub arguments: HashMap<ModelId, String>,
+    /// All votes cast this round.
+    pub votes: Vec<CouncilVote>,
+    /// Did consensus emerge this round?
+    pub consensus_reached: bool,
+    /// Summary of this round's outcome (generated by the synthesizer).
+    pub summary: String,
+}
+
+/// A resolution option proposed by the council for parties to act on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResolutionOption {
+    pub idx: usize,
+    pub label: String,
+    /// Plain-English description of the resolution.
+    pub description: String,
+    /// The number of council models that approved this option.
+    pub approval_votes: usize,
+    /// Total valid votes cast.
+    pub total_votes: usize,
+    /// true when approval_votes > total_votes / 2.
+    pub approved: bool,
+    /// Settlement detail if this maps to a formal fair-division outcome.
+    pub settlement: Option<Settlement>,
+    /// The normalized formal predicate(s) this resolution requires to hold.
+    /// Empty for non-formalizable options.
+    pub requires_predicates: Vec<String>,
+}
+
+/// The full council deliberation record for a dispute.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CouncilDeliberation {
+    /// The dispute this deliberation is over.
+    pub dispute_title: String,
+    /// Council models that participated.
+    pub models: Vec<(ModelId, String)>,
+    /// All rounds of deliberation (typically 1–3).
+    pub rounds: Vec<DeliberationRound>,
+    /// Resolution options the council generated and voted on.
+    pub options: Vec<ResolutionOption>,
+    /// Options that passed the majority vote threshold (> 50% approval).
+    pub approved_options: Vec<usize>,
+    /// If no options were approved and parties pre-agreed to binding mode,
+    /// the council's single best recommendation.
+    pub binding_recommendation: Option<String>,
+    /// Hash-chained receipts covering the full deliberation.
+    pub receipts: Vec<Receipt>,
+    /// UTC ISO-8601 timestamp when deliberation completed.
+    pub completed_at: String,
+    /// anti-malfeasance: total suspicious votes detected and excluded.
+    pub flagged_votes: usize,
 }
 
 // ──────────────────────── trait interfaces (seams) ───────────────────────
 
-/// A single proof obligation, fully expressed in Isabelle/HOL text. The core
-/// generates these (it owns the reduction); the prover only runs them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Obligation {
     pub name: String,
-    /// The goal as an Isabelle/HOL proposition, e.g. `"refund_due = 75000"`.
     pub goal: String,
-    /// Proof method text to attempt, e.g. `"by (simp add: refund_due_def)"`.
-    /// A goal that is *expected to be undecidable* (e.g. the crux) is given a
-    /// best-effort method; failure to discharge is reported as `Unknown`, which
-    /// is itself the informative answer.
     pub proof: String,
 }
 
-/// The **trusted gate**. Each obligation is checked *in isolation* against a
-/// shared `preamble` (theory text from `theory … begin` through all
-/// declarations/definitions/axiomatizations, with no trailing `end`). Knows
-/// nothing about disputes — it runs Isabelle and parses the outcome.
 pub trait Prover {
     fn check(&self, preamble: &str, obligations: &[Obligation]) -> HashMap<String, Verdict>;
 }
 
-/// Fair division over divisible stakes. Returns one or more certified options.
 pub trait FairDivider {
     fn divide(
         &self,
@@ -234,12 +311,7 @@ pub trait FairDivider {
     ) -> Vec<Settlement>;
 }
 
-/// The **untrusted operator**: proposes formalizations. Never trusted; every
-/// output is gated by a `Prover` before it touches the record.
 pub trait LlmOperator {
-    /// Propose a formalization of `nl` reusing the given signature symbols.
     fn formalize(&self, nl: &str, sig: &[Sig]) -> Result<Formula, String>;
-    /// A model's prose rendering of a formula (advisory; the deterministic
-    /// renderer in `mediator-core` is the trusted one).
     fn render_english(&self, f: &Formula) -> String;
 }
